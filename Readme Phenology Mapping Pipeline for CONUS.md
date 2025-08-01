@@ -82,6 +82,6 @@ Script Pipeline
 
 Outputs
 
--Phenology stacks: projects/horia-olariu/assets/Greening/Phenology_<year>_CONUS
--Trends raster: projects/horia-olariu/assets/Greening/GreeningTrends (10 bands of robust slopes)
--Input AOI: projects/horia-olariu/assets/Greening/CONUS_Union
+- Phenology stacks: projects/horia-olariu/assets/Greening/Phenology_<year>_CONUS
+- Trends raster: projects/horia-olariu/assets/Greening/GreeningTrends (10 bands of robust slopes)
+- Input AOI: projects/horia-olariu/assets/Greening/CONUS_Union
