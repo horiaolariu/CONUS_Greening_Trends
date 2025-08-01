@@ -1,0 +1,64 @@
+/***************************************************************
+ *  k PIXELS PER 0.1° CELL,  CAPPED AT N_CAP PER ECOREGION
+ ***************************************************************/
+
+/*** 1 ▸  USER SETTINGS ****************************************/
+var GRID   = 0.1;      // 0.1° grid  (~11 km)
+var K_PER  = 2;        // pixels per cell  (start small; raise later)
+var N_CAP  = 20000;    // max rows per ecoregion
+var SCALE  = 500;      // 500-m resolution
+var SEED   = 42;       // reproducible
+
+/*** 2 ▸  PREP IMAGE  (phenology mask only) ********************/
+var mega  = ee.Image('projects/horia-olariu/assets/Greening/megaSlopeStack');
+var phen  = mega.select('NDVI_SOS_slope');         // phenology band mask
+var lonlat = ee.Image.pixelLonLat().rename(['lon','lat']);
+
+// Leave predictors exposed, mask only by phenology
+var base = mega.unmask(-9999)
+               .updateMask(phen.mask())
+               .addBands(lonlat);
+
+/* Build integer grid-cell ID for 0.1° lattice */
+var lonBin = lonlat.select('lon').divide(GRID).floor().toInt();
+var latBin = lonlat.select('lat').divide(GRID).floor().toInt();
+var cellID = lonBin.multiply(100000).add(latBin)   // huge ID, but integer
+               .rename('cellID').toInt();
+
+/*** 3 ▸  LOOP THROUGH 20  ECOREGIONS  ************************/
+var ECO = ee.FeatureCollection(
+  'projects/horia-olariu/assets/Greening/EPA_Ecoregions_L2_CONUS')
+           .toList(20);
+
+for (var i = 0; i < 20; i++) {
+
+  var eco      = ee.Feature(ECO.get(i));
+  var ecoName  = eco.get('na_l2name').getInfo();          // client string
+  var tag      = ecoName.replace(/\s+/g,'_');             // safe filename
+  var region   = eco.geometry();
+
+  /*  -- sample k pixels per 0.1° cell -- */
+  var tbl = base.addBands(cellID)
+                .stratifiedSample({
+                   region:      region,
+                   classBand:   'cellID',
+                   numPoints:   K_PER,         // 2 per cell (adjust)
+                   scale:       SCALE,
+                   seed:        SEED + i,
+                   geometries:  false,
+                   tileScale:   12             // high to avoid mem caps
+                 })
+                .randomColumn('r', SEED + 100 + i)
+                .limit(N_CAP)                  // per-eco cap
+                .map(function(pt){ return pt.set('ecoName', ecoName); });
+
+  print(ecoName + ' rows', tbl.size());        // console check
+
+  Export.table.toDrive({
+    collection: tbl,
+    description:'eco_'+tag,
+    folder:     'EcoSamples_01deg',            // new folder
+    fileNamePrefix:'eco_'+tag,
+    fileFormat:'CSV'
+  });
+}

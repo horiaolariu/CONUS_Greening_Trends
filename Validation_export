@@ -1,0 +1,58 @@
+/******************** 0.  INPUTS *****************************/
+var pts = ee.FeatureCollection(
+  'projects/horia-olariu/assets/Greening/Validation_points');
+
+var imgRoot = 'projects/horia-olariu/assets/Greening/Phenology_'; // +YYYY_CONUS
+
+// Phenology bands to pull for every point
+var bands = [
+  'NDVI_SOS', 'EVI_SOS',
+  'NDVI_EOS', 'EVI_EOS',
+  'NDVI_POSstart', 'EVI_POSstart'
+];
+
+/******************** 1.  BUILD SAMPLES **********************/
+var outFC = ee.FeatureCollection([]);
+
+for (var yr = 2000; yr <= 2024; yr++) {
+
+  // Year-specific phenology raster
+  var img   = ee.Image(imgRoot + yr + '_CONUS');
+
+  // Validation points for that year
+  var ptsYr = pts.filter(ee.Filter.eq('Year', yr));
+  if (ptsYr.size().eq(0).getInfo()) continue;          // skip years with no pts
+
+  // Attach all six bands to each point
+  var sample = img
+      .select(bands)
+      .sampleRegions({
+        collection : ptsYr,
+        scale      : 500,      // native resolution
+        geometries : true      // keep lat/long
+      });
+
+  outFC = outFC.merge(sample);
+}
+
+/******************** 2.  EXPORT TO DRIVE ********************/
+Export.table.toDrive({
+  collection : outFC,
+  description: 'Phenology_validation_extract_allBands',
+  folder     : 'Greening',
+  fileFormat : 'CSV'
+});
+
+/******************** 3.  ONE-POINT VERIFICATION ************/
+// Pick the first point and its year just to confirm band values
+var firstPt   = ee.Feature(pts.first());
+var testYear  = ee.Number(firstPt.get('Year')).getInfo();   // bring to client
+var imgTest   = ee.Image(imgRoot + testYear + '_CONUS').select(bands);
+
+print('First validation point (year ' + testYear + '):', firstPt);
+print('Sampled phenology values at that point:',
+      imgTest.sample(firstPt.geometry(), 500));
+
+/******************** 4.  QUICK QC **************************/
+print('Validation points by year:',
+      pts.aggregate_histogram('Year'));

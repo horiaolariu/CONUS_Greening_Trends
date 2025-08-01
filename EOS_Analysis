@@ -1,0 +1,198 @@
+/***************************************************************
+ * End‑of‑Season (EOS)  –  CONUS (MODIS/061/MOD13A1, 500 m)
+ *   • Scales NDVI & EVI × 0.0001
+ *   • Computes senescence threshold (largest negative VI drop)
+ *   • Fits 6‑order polynomial and finds first DOY 274‑365 where
+ *     fitted VI ≤ threshold
+ *   • Exports annual EOS stacks (2000‑2024) to your Assets
+ *   • Adds thresholds and EOS 2015 layers to the Map
+ ***************************************************************/
+
+/* ---------- SETTINGS ---------- */
+var startYear   = 2000;
+var endYear     = 2024;
+var sampleYear  = 2015;                   // year shown on the map
+var assetRoot   = 'Greening/'; // export prefix
+
+/* ---------- 1.  AOI : CONUS outline  ----------------------- */
+var conus = ee.FeatureCollection('projects/horia-olariu/assets/Greening/CONUS_Union')
+               .filter('name == "CONUS_outline"')
+               .geometry();
+Map.centerObject(conus, 4);
+Map.addLayer(conus, {color:'black'}, 'CONUS outline');
+
+/* ---------- 2.  LOAD & QA‑MASK MOD13A1 --------------------- */
+var modRaw = ee.ImageCollection('MODIS/061/MOD13A1')
+               .filterBounds(conus)
+               .filterDate('2000-02-24', '2025-04-04');
+
+function qaMask(img){
+  var land = img.select('DetailedQA')
+                .rightShift(11).bitwiseAnd(7).eq(1);
+  return img.updateMask(land);
+}
+var modMasked = modRaw.map(qaMask);
+
+/* ---------- 3.  SCALE NDVI/EVI  + DOY (overwrite raw) ----- */
+var scale = 0.0001;
+function addBands(img){
+  var doy = ee.Date(img.get('system:time_start')).getRelative('day','year');
+  return img
+    .addBands(img.select('NDVI').multiply(scale).rename('NDVI'), null, true)
+    .addBands(img.select('EVI' ).multiply(scale).rename('EVI' ), null, true)
+    .addBands(ee.Image.constant(doy).int16().rename('doy'))
+    .set('doy', doy);
+}
+var viCol = modMasked.map(addBands);
+
+/* ---------- 4.  3‑DAY ROLLING‑MEAN BASELINE (2000‑24) ----- */
+var base    = viCol.filter(ee.Filter.calendarRange(startYear, endYear, 'year'));
+var doyList = base.aggregate_array('doy').distinct().sort();
+
+var rolling = ee.ImageCollection(
+  doyList.map(function(d){
+    d = ee.Number(d);
+    var win = base.filter(ee.Filter.and(
+        ee.Filter.gte('doy', d.subtract(1)),
+        ee.Filter.lte('doy', d.add(1))
+    ));
+    return ee.Algorithms.If(win.size().gt(0), win.mean().set('doy', d), null);
+  })
+).filter(ee.Filter.notNull(['doy']));
+
+/* vegetation mask (mean NDVI ≥ 0.10) */
+var vegMask = rolling.mean().select('NDVI').gte(0.10);
+
+/* ---------- 5.  SENESCENCE THRESHOLDS ---------------------- */
+function senThreshold(idx){
+  var rollList = rolling.select(idx)
+                        .map(function(im){ return im.updateMask(vegMask); })
+                        .sort('doy')
+                        .toList(rolling.size());
+
+  var last = ee.Number(rollList.size()).subtract(2);
+  var seq  = ee.List.sequence(0, last);
+
+  var invCol = ee.ImageCollection(seq.map(function(i){
+      i = ee.Number(i);
+      var today = ee.Image(rollList.get(i));
+      var next  = ee.Image(rollList.get(i.add(1)));          // next composite
+      var inv   = next.subtract(today).divide(today.add(1e-6))
+                      .multiply(-1).rename('inv');
+      return next.addBands(inv);                             // next‑day VI = threshold
+  }));
+
+  return ee.Image(
+    ee.Algorithms.If(
+      invCol.size().eq(0),
+      ee.Image.constant(-999).rename(idx + '_thr'),
+      invCol.qualityMosaic('inv').select(idx).rename(idx + '_thr')
+    )
+  ).clip(conus);
+}
+var thrNDVI = senThreshold('NDVI');
+var thrEVI  = senThreshold('EVI');
+
+Map.addLayer(thrNDVI, {min:0, max:1, palette:['red','yellow','green']},
+             'NDVI threshold');
+Map.addLayer(thrEVI , {min:0, max:1, palette:['red','yellow','blue']},
+             'EVI  threshold');
+
+/* ---------- 6.  POLY FIT HELPERS --------------------------- */
+var pNames = ['c0','c1','c2','c3','c4','c5','c6'];
+function addPredictors(im){
+  var x = im.select('doy').toFloat();
+  return im.addBands(ee.Image.cat([
+      ee.Image.constant(1), x, x.pow(2), x.pow(3),
+      x.pow(4), x.pow(5), x.pow(6)
+  ]).rename(pNames));
+}
+function coeffs(idx, yr){
+  var start = (yr === 2000) ? '2000-02-24' : yr + '-01-01';
+  var col = viCol.filterDate(start, yr + '-12-31')
+                 .filterBounds(conus)
+                 .map(addPredictors)
+                 .select(pNames.concat([idx]))
+                 .map(function(im){ return im.updateMask(vegMask); });
+  return col.reduce(ee.Reducer.linearRegression({numX:7,numY:1}))
+            .select('coefficients')
+            .arrayProject([0]).arrayFlatten([pNames])
+            .rename(pNames.map(function(c){ return idx + '_' + c; }));
+}
+function evalPoly(C, day, idx){
+  var x = ee.Image.constant(day);
+  var y = C.select(idx+'_c0');
+  for (var p = 1; p <= 6; p++){
+      y = y.add(C.select(idx+'_c'+p).multiply(x.pow(p)));
+  }
+  return y;
+}
+
+/* ---------- 7.  EOS band builder --------------------------- */
+function eosBand(C, idx, thr){
+  var days = ee.List.sequence(274, 365);
+  var imgs = ee.ImageCollection(days.map(function(d){
+      d = ee.Number(d);
+      var ok  = evalPoly(C, d, idx).lte(thr);
+      var day = ee.Image.constant(d).int16().rename('day');
+      return day.updateMask(ok);
+  }));
+  var eos = imgs.min().int16();
+  return eos.where(eos.eq(0), -999).rename(idx + '_EOS').clip(conus);
+}
+
+/* ---------- 8.  EXPORT LOOP (2000‑2024) -------------------- */
+for (var yr = startYear; yr <= endYear; yr++){
+  print('Queuing year', yr);
+  var Cn = coeffs('NDVI', yr);
+  var Ce = coeffs('EVI' , yr);
+
+  var out = ee.Image.cat([
+        eosBand(Cn,'NDVI', thrNDVI),
+        eosBand(Ce,'EVI' , thrEVI )
+  ]).set('year', yr);
+  
+    /* new export name */
+  var exportName = 'EOS_' + yr + '_CONUS';
+
+  /* quick layer for sampleYear */
+  if (yr === sampleYear){
+    Map.addLayer(out.select('NDVI_EOS'),
+      {min:274,max:365,palette:['green','yellow','red']},
+      'NDVI EOS '+yr);
+    Map.addLayer(out.select('EVI_EOS'),
+      {min:274,max:365,palette:['blue','cyan','purple']},
+      'EVI  EOS '+yr);
+  }
+
+  Export.image.toAsset({
+    image:      out.unmask(-999),
+    description: exportName,
+    assetId:    assetRoot + exportName,            // e.g. .../CONUS_EOS_2001
+    region:     conus,
+    scale:      500,
+    crs:        'EPSG:4326',
+    maxPixels:  1e13
+  });
+}
+
+/* ---------- 9.  OPTIONAL pixel‑diagnostics ------------------
+   (comment out if not needed – large AOI can spam the console) */
+Map.onClick(function(coords){
+  var pt = ee.Geometry.Point(coords.lon, coords.lat);
+  var thr = thrNDVI.reduceRegion({
+      reducer:ee.Reducer.first(), geometry:pt, scale:500
+  }).get('NDVI_thr');
+  var C = coeffs('NDVI', sampleYear);
+  var minFit = ee.Number(
+      ee.List.sequence(250,365).map(function(d){
+          d = ee.Number(d);
+          return evalPoly(C,d,'NDVI')
+            .reduceRegion({reducer:ee.Reducer.first(),
+                           geometry:pt, scale:500})
+            .get('NDVI');
+      }).reduce(ee.Reducer.min()));
+  print('Pixel',coords.lon.toFixed(3),coords.lat.toFixed(3),
+        '\nThreshold:',thr,
+        '\nMin NDVI fit 250‑365:',minFit);
+});

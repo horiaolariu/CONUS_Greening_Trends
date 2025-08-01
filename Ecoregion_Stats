@@ -1,0 +1,155 @@
+// Load table (FeatureCollection)
+var ecoregions = ee.FeatureCollection('projects/horia-olariu/assets/Greening/EPA_Ecoregions_L2_CONUS');
+
+// Load image
+var img = ee.Image('projects/horia-olariu/assets/Greening/GreeningTrends');
+
+// List of band names
+var bandNames = img.bandNames();
+
+// Set up a reducer for just the desired stats for each band
+var statsReducer = ee.Reducer.mean()
+  .combine(ee.Reducer.median(), '', true)
+  .combine(ee.Reducer.stdDev(), '', true)
+  .combine(ee.Reducer.count(), '', true)
+  .combine(ee.Reducer.kurtosis(), '', true);
+
+// Zonal stats (polygon-wise stats for each band)
+var zonalStats = img.reduceRegions({
+  collection: ecoregions,
+  reducer: statsReducer,
+  scale: 500,
+  crs: 'EPSG:4326'
+});
+
+// Add CV (stdDev/mean) for each band as a new property
+var addCV = function(feature) {
+  bandNames.getInfo().forEach(function(band) {
+    var mean = feature.get(band + '_mean');
+    var std = feature.get(band + '_stdDev');
+    var cv = ee.Algorithms.If(
+      ee.Number(mean).neq(0),
+      ee.Number(std).divide(ee.Number(mean)),
+      null
+    );
+    feature = feature.set(band + '_cv', cv);
+  });
+  return feature;
+};
+
+zonalStats = zonalStats.map(addCV);
+
+// Build property list for export: region name + stats for each band
+var desiredProps = ['na_l2name']; // Use your region name property here!
+bandNames.getInfo().forEach(function(band) {
+  desiredProps.push(band + '_mean');
+  desiredProps.push(band + '_median');
+  desiredProps.push(band + '_stdDev');
+  desiredProps.push(band + '_cv');
+  desiredProps.push(band + '_kurtosis');
+  desiredProps.push(band + '_count');
+});
+
+// Export only the needed properties, **and without geometry**
+Export.table.toDrive({
+  collection: zonalStats.select(desiredProps).map(function(f) { return f.setGeometry(null); }),
+  description: 'Ecoregion_GreeningTrends_SelectedStats',
+  fileFormat: 'CSV'
+});
+
+//
+// Specific land cover stats
+//
+
+// Load table (FeatureCollection)
+var ecoregions = ee.FeatureCollection('projects/horia-olariu/assets/Greening/EPA_Ecoregions_L2_CONUS');
+
+// Load image
+var img = ee.Image('projects/horia-olariu/assets/Greening/GreeningTrends');
+
+// List of band names as JS array
+var bandNames = img.bandNames().getInfo();
+
+// Load MODIS Land Cover (LC_Type5)
+var lc = ee.ImageCollection("MODIS/061/MCD12Q1").select('LC_Type5');
+var lc2001 = lc.filter(ee.Filter.calendarRange(2001, 2001, 'year')).first();
+var lc2023 = lc.filter(ee.Filter.calendarRange(2023, 2023, 'year')).first();
+
+// (Optional: print to check images loaded)
+print('2001 land cover image:', lc2001);
+print('2023 land cover image:', lc2023);
+
+// Stable shrub mask: LC_Type5 == 5 in both years
+var isShrub2001 = lc2001.eq(5);
+var isShrub2023 = lc2023.eq(5);
+var ShrubStableMask = isShrub2001.and(isShrub2023);
+
+// Apply mask to all bands of the image
+var imgShrubOnly = img.updateMask(ShrubStableMask);
+
+// Reducer for desired stats
+var statsReducer = ee.Reducer.mean()
+  .combine(ee.Reducer.median(), '', true)
+  .combine(ee.Reducer.stdDev(), '', true)
+  .combine(ee.Reducer.count(), '', true)
+  .combine(ee.Reducer.kurtosis(), '', true);
+
+// Calculate zonal stats
+var zonalStats = imgShrubOnly.reduceRegions({
+  collection: ecoregions,
+  reducer: statsReducer,
+  scale: 500,
+  crs: 'EPSG:4326'
+});
+
+// Add CV (stdDev/mean) for each band, handling all null, undefined, NaN, and mean=0 cases
+var addCV = function(feature) {
+  bandNames.forEach(function(band) {
+    var mean = feature.get(band + '_mean');
+    var std = feature.get(band + '_stdDev');
+    var cv = null;
+    // Only calculate CV if mean and std are valid and mean ≠ 0
+    if (
+      mean !== null && mean !== undefined && !isNaN(mean) && mean !== 0 &&
+      std !== null && std !== undefined && !isNaN(std)
+    ) {
+      cv = ee.Number(std).divide(ee.Number(mean));
+    }
+    feature = feature.set(band + '_cv', cv);
+  });
+  return feature;
+};
+zonalStats = zonalStats.map(addCV);
+
+// Build property list for export: region name + stats for each band
+var desiredProps = ['na_l2name'];
+bandNames.forEach(function(band) {
+  desiredProps.push(band + '_mean');
+  desiredProps.push(band + '_median');
+  desiredProps.push(band + '_stdDev');
+  desiredProps.push(band + '_cv');
+  desiredProps.push(band + '_kurtosis');
+  desiredProps.push(band + '_count');
+});
+
+// Filter to regions with at least one valid pixel for the first band
+var firstBand = bandNames[0];
+var validZonalStats = zonalStats.filter(ee.Filter.gt(firstBand + '_count', 0));
+
+// Export only the needed properties, and without geometry
+Export.table.toDrive({
+  collection: validZonalStats.select(desiredProps).map(function(f) { return f.setGeometry(null); }),
+  description: 'Ecoregion_GreeningTrends_SelectedStats_ShrubOnly_ValidOnly',
+  fileFormat: 'CSV'
+});
+
+
+// Export to Google Drive folder "Greening"
+Export.table.toDrive({
+  collection: ecoregions,
+  description: 'EPA_Ecoregions_L2_CONUS_Export',
+  folder: 'Greening',
+  fileNamePrefix: 'EPA_Ecoregions_L2_CONUS',
+  fileFormat: 'SHP'
+});
+

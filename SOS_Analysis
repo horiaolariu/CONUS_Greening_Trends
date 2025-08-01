@@ -1,0 +1,296 @@
+/***************************************************************
+ * SOS maps for CONUS
+ * using MODIS/061/MOD13A1 Data (2000-02-24 to 2025-04-04) for NDVI and EVI.
+ *  (500 m resolution; bands are NDVI and EVI, scaled by 0.0001)
+ *
+ * Methodology:
+ * 1. Use MOD13A1 NDVI and EVI.
+ * 2. Build a multiyear (2000–2024) seasonal curve by creating a 3‑day rolling mean
+ *    composite for each available day‑of‑year (DOY) in the baseline period.
+ * 3. For each index, compute the day‑to‑day ratio between adjacent 3‑day composites
+ *    and select the VI value corresponding to the maximum ratio as the green‑up threshold.
+ * 4. For each target year, fit a sixth‑order polynomial (using predictor bands up to DOY⁶)
+ *    to the daily time series (January–October 1; for 2000, from 2000‑02‑24)
+ *    and evaluate it at daily intervals.
+ * 5. Identify SOS as the first day (0–273) when the fitted curve meets/exceeds the threshold.
+ *    Pixels with no valid SOS are assigned –999.
+ * 6. Export annual SOS maps (with NDVI_SOS and EVI_SOS bands) and the combined threshold image
+ *    (NDVI_thr and EVI_thr).
+ *
+ * All processing is clipped exactly to the East Central Texas forests ecoregion.
+ ***************************************************************/
+
+/* ── USER SETTINGS ───────────────────────────────────────────*/
+var startYear = 2000;
+var endYear   = 2024;
+var assetFolder = 'users/horia-olariu/assets/Greening/';  // Adjust as needed
+
+// Process both NDVI and EVI.
+var indices = ['NDVI', 'EVI'];
+
+/* ── STUDY AREA (CONUS) ─────────────────────────────────────*/
+var conus = ee.FeatureCollection(
+               'projects/horia-olariu/assets/Greening/CONUS_Union')
+             .filter(ee.Filter.eq('name','CONUS_outline'))
+             .geometry();
+
+/* ── SOURCE DATA: MODIS/061/MOD13A1 (500 m) ─────────*/
+// Load the dataset (which already includes NDVI and EVI).
+var mod13a1 = ee.ImageCollection("MODIS/061/MOD13A1")
+               .filterBounds(conus)
+               .filterDate('2000-02-24', '2025-04-04')
+               .filter(ee.Filter.notNull(['system:time_start']));
+
+var scale = 0.0001;  // NDVI/EVI are scaled by 0.0001
+
+/***** QA MASKING *****/
+/* Function to apply a QA mask using the "DetailedQA" band.
+   We extract bits 11–13 and retain only pixels equal to 1 (land, nothing else but land). */
+function applyQAMask(img) {
+  var qa = img.select('DetailedQA');
+  // Bits 11-13: Shift right by 11 and bitwiseAnd with 7.
+  var landMask = qa.rightShift(11).bitwiseAnd(7).eq(1);
+  return img.updateMask(landMask);
+}
+
+// Apply QA mask.
+var mod13a1Masked = mod13a1.map(applyQAMask);
+
+/* Function to add DOY and (if needed) re-scale NDVI/EVI.
+   Since the product already contains NDVI and EVI bands, we multiply them
+   by 0.0001 (to convert integer values to 0-1) and add a DOY band. */
+function addVIs(img) {
+  var ndvi = img.select('NDVI').multiply(scale).rename('NDVI');
+  var evi  = img.select('EVI').multiply(scale).rename('EVI');
+  var doy  = ee.Number(ee.Date(img.get('system:time_start')).getRelative('day', 'year')).round();
+  img = img.addBands(ndvi, null, true);
+  img = img.addBands(evi, null, true);
+  img = img.addBands(ee.Image.constant(doy).rename('doy').toInt16(), null, true);
+  return img.set('doy', doy);
+}
+var mod13a1VIs = mod13a1Masked.map(addVIs);
+
+/* ---- DEBUG CHECK 1: Inspect DOY, NDVI, and EVI (clipped to ecoregion) ---- */
+var testImg = mod13a1VIs.first().clip(conus);
+Map.addLayer(testImg.select('doy'), {min:0, max:365}, 'Test DOY (clipped)');
+print('First image properties:', testImg.toDictionary());
+Map.addLayer(testImg.select('NDVI'), {min:0, max:1, palette:['white','green']}, 'Test NDVI (clipped)');
+Map.addLayer(testImg.select('EVI'), {min:0, max:1, palette:['white','blue']}, 'Test EVI (clipped)');
+
+/* ── 1. Build Baseline Seasonal Curve with 3‑Day Rolling Mean (2000–2024) ─────────*/
+// Filter baseline period.
+var baseline = mod13a1VIs.filter(ee.Filter.calendarRange(startYear, endYear, 'year'));
+// Get unique available DOY values.
+var doyList = baseline.aggregate_array('doy').distinct().sort();
+print('Unique DOYs in baseline:', doyList);
+// Build 3‑day rolling composites: for each available DOY, average images with DOY in [d-1, d+1].
+var rollingMean = ee.ImageCollection(
+  doyList.map(function(d) {
+    d = ee.Number(d);
+    var lower = d.subtract(1).max(0);
+    var upper = d.add(1).min(365);
+    var comp = baseline.filter(ee.Filter.and(
+                  ee.Filter.gte('doy', lower),
+                  ee.Filter.lte('doy', upper)
+                )).mean().set('doy', d);
+    return comp;
+  })
+);
+
+/* ---- DEBUG CHECK 2: Baseline NDVI and Vegetation Mask ---- */
+var baseMeanNDVI = rollingMean.mean().select('NDVI');
+Map.addLayer(baseMeanNDVI.clip(conus), {min:0, max:1, palette:['white','green']}, 'Baseline Mean NDVI (3-day, clipped)');
+var vegMask = baseMeanNDVI.gte(0.1);
+Map.addLayer(vegMask.clip(conus), {min:0, max:1, palette:['black','yellow']}, 'Vegetation Mask (NDVI>=0.1, clipped)');
+print('Baseline Mean NDVI Stats:', baseMeanNDVI.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: conus,
+  scale: 500,
+  maxPixels: 1e9
+}));
+
+/* ── 2. Derive Green-Up Thresholds for Each Index ─────────*/
+// For each index, compute the day-to-day ratio between adjacent 3‑day composites
+// and use qualityMosaic to extract the threshold.
+var thresholds = {};
+indices.forEach(function(idx) {
+  var dm = rollingMean.select(idx).sort('doy');
+  var valid = dm.toList(dm.size());
+  var validSize = ee.Number(valid.size());
+  print('validSize for ' + idx, validSize);
+  var lastInt = validSize.subtract(2).floor();
+  print('lastInt for ' + idx, lastInt);
+  var seq = ee.List.sequence(0, lastInt);
+  var ratioCol = ee.ImageCollection(seq.map(function(i) {
+    i = ee.Number(i);
+    var today = ee.Image(valid.get(i));
+    var next = ee.Image(valid.get(i.add(1)));
+    var r = next.subtract(today).divide(today.add(1e-6)).rename(idx + '_ratio');
+    return today.addBands(r);
+  }));
+  print('ratioCol size for ' + idx, ratioCol.size());
+  
+  var thresh = ee.Image(ee.Algorithms.If(
+    ratioCol.size().eq(0),
+    ee.Image.constant(-999).rename(idx + '_thr'),
+    ratioCol.qualityMosaic(idx + '_ratio').select(idx).rename(idx + '_thr')
+  ));
+  thresholds[idx] = thresh;
+});
+
+Map.addLayer(thresholds['NDVI'].clip(conus), {min:0, max:1, palette:['red','yellow','green']}, 'NDVI Threshold (clipped)');
+Map.addLayer(thresholds['EVI'].clip(conus), {min:0, max:1, palette:['red','yellow','blue']}, 'EVI Threshold (clipped)');
+print('NDVI Threshold Stats:', thresholds['NDVI'].reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: conus,
+  scale: 500,
+  maxPixels: 1e9
+}));
+print('EVI Threshold Stats:', thresholds['EVI'].reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: conus,
+  scale: 500,
+  maxPixels: 1e9
+}));
+
+/* ── 3. Polynomial Fitting Setup ─────────*/
+// Create polynomial predictors: constant, DOY, DOY^2, ... DOY^6.
+var preds = ['c0','c1','c2','c3','c4','c5','c6'];
+function addPredictors(img) {
+  var x = img.select('doy').toFloat();
+  var predictors = ee.Image.cat([
+    ee.Image.constant(1), x, x.pow(2), x.pow(3),
+    x.pow(4), x.pow(5), x.pow(6)
+  ]).rename(preds);
+  return img.addBands(predictors);
+}
+
+/* Define evalPoly: Evaluate the polynomial given coefficients, a day, and an index. */
+function evalPoly(coeff, day, idx) {
+  var x = ee.Image.constant(day);
+  return coeff.select(idx + '_c0')
+      .add(coeff.select(idx + '_c1').multiply(x))
+      .add(coeff.select(idx + '_c2').multiply(x.pow(2)))
+      .add(coeff.select(idx + '_c3').multiply(x.pow(3)))
+      .add(coeff.select(idx + '_c4').multiply(x.pow(4)))
+      .add(coeff.select(idx + '_c5').multiply(x.pow(5)))
+      .add(coeff.select(idx + '_c6').multiply(x.pow(6)))
+      .rename(idx + '_fit');
+}
+
+/* Fit a 6th‑order polynomial regression (VI vs. DOY) for a given index and year.
+   For 2000, start on 2000‑02‑24; for later years, use January 1.
+   Use data from January to October 1, masking by vegMask.
+*/
+function fitCoeffs(idx, yr) {
+  var startDate = (yr === 2000) ? '2000-02-24' : yr + '-01-01';
+  var endDate = yr + '-10-01';
+  var col = mod13a1VIs.filterDate(startDate, endDate)
+                     .filterBounds(conus)
+                     .map(addPredictors)
+                     .select(preds.concat([idx]))
+                     .map(function(image) {
+                       return image.updateMask(vegMask);
+                     });
+  var empty = col.size().eq(0);
+  var coeff = ee.Algorithms.If(
+    empty,
+    ee.Image.constant([-999,-999,-999,-999,-999,-999,-999])
+       .rename(preds.map(function(p){ return idx + '_' + p; })),
+    col.reduce(ee.Reducer.linearRegression({numX: 7, numY: 1}))
+       .select('coefficients')
+       .arrayProject([0])
+       .arrayFlatten([preds])
+       .rename(preds.map(function(p){ return idx + '_' + p; }))
+  );
+  return ee.Image(coeff);
+}
+
+/* ---- DEBUG SECTION: Print NDVI coefficients for 2015 ---- */
+var coeffNDVI2015 = fitCoeffs('NDVI', 2015);
+print('NDVI coefficients for 2015:', coeffNDVI2015);
+
+/* Evaluate the NDVI polynomial for a sample point every 16 days and print values. */
+var samplePoint = conus.centroid();
+var polyEvalList = ee.List.sequence(0, 273, 16).map(function(d) {
+  d = ee.Number(d);
+  var pred = evalPoly(coeffNDVI2015, d, 'NDVI');
+  var value = pred.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: samplePoint,
+    scale: 500,
+    maxPixels: 1e9
+  }).get('NDVI_fit');
+  return ee.Dictionary({'DOY': d, 'NDVI_fit': value});
+});
+print('NDVI polynomial evaluation at sample point (every 16 days):', polyEvalList);
+
+/* ── 4. SOS Retrieval ─────────*/
+// For each day in 0–273, create an image that equals the day if the fitted curve meets/exceeds the threshold; otherwise, assign 999.
+// Then compute the pixelwise minimum and replace 999 with –999.
+function sosBand(coeff, idx) {
+  var dayImages = ee.ImageCollection(
+    ee.List.sequence(0, 273).map(function(day) {
+      var fit = evalPoly(coeff, day, idx);
+      var condition = fit.gte(thresholds[idx]);
+      var dayImg = ee.Image.constant(day).updateMask(condition).unmask(999).rename('doy');
+      return dayImg;
+    })
+  );
+  var sos = dayImages.min().rename(idx + '_SOS').toInt16();
+  sos = sos.where(sos.eq(999), -999);
+  return sos;
+}
+
+/* Build annual SOS maps for each index. */
+var sosImages = [];
+for (var yr = startYear; yr <= endYear; yr++) {
+  var coeffs = {};
+  indices.forEach(function(idx) {
+    coeffs[idx] = fitCoeffs(idx, yr);
+  });
+  var sosPerYear = ee.Image.cat(
+    indices.map(function(idx) { return sosBand(coeffs[idx], idx); })
+  ).set('year', yr).clip(conus);
+  sosImages.push(sosPerYear);
+}
+var sosCollection = ee.ImageCollection(sosImages);
+var sampleSOS = sosCollection.filter(ee.Filter.eq('year', 2015)).first();
+print('2015 SOS (NDVI & EVI) sample:', sampleSOS.toDictionary());
+
+/* ── 5. Display Examples ─────────*/
+Map.centerObject(conus, 8);
+Map.addLayer(sampleSOS.select('NDVI_SOS'),
+             {min: 0, max: 273, palette: ['purple','cyan','green','yellow','red']},
+             'NDVI SOS 2015');
+Map.addLayer(sampleSOS.select('EVI_SOS'),
+             {min: 0, max: 273, palette: ['blue','lightblue','cyan','lime','yellow']},
+             'EVI SOS 2015');
+
+/* ── 6. Export Results ─────────*/
+// Export annual SOS images.
+sosImages.forEach(function(img, i) {
+  var yr = startYear + i;
+  Export.image.toAsset({
+    image: img.unmask(-999),
+    description: 'SOS_' + yr,
+    assetId: assetFolder + 'SOS_' + yr,
+    region: conus,
+    scale: 500,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+});
+// Export the combined threshold image.
+var threshImage = ee.Image.cat([thresholds['NDVI'], thresholds['EVI']])
+                      .rename(['NDVI_thr', 'EVI_thr'])
+                      .clip(conus);
+Export.image.toAsset({
+  image: threshImage.unmask(-999),
+  description: 'Thresholds_NDVI_EVI',
+  assetId: assetFolder + 'Thresholds_NDVI_EVI',
+  region: conus,
+  scale: 500,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});

@@ -1,0 +1,176 @@
+/***************************************************************
+ *  Clean 25 SOS/EOS_<YEAR>_CONUS images (2000‑2024)
+ *  ∘ Masks Cropland / Urban / Mosaic / Barren (LC 12,13,14,16)
+ *  ∘ Masks any pixel where NDVI_SOS or EVI_SOS == 0 or –999
+ *  ∘ Reprojects & exports to EPSG:4326  (0.0045° ≈ 500 m)
+ ***************************************************************/
+
+// ───── user options ───────────────────────────────────────────
+var inspectYear = 2024;                 // map preview year
+var outCrs      = 'EPSG:4326';          // export CRS
+var outScaleDeg = 0.0045;               // ≈ 500 m
+//----------------------------------------------------------------
+
+// land‑cover classes to remove
+var BAD_CLASSES = [12, 13, 14, 16];
+var BAD_ZEROS   = [0, 0, 0, 0];
+
+// ───── mask builders ─────────────────────────────────────────
+function lcMask(lcImg) {
+  return lcImg.select('LC_Type1')
+              .remap(BAD_CLASSES, BAD_ZEROS, 1)
+              .selfMask();
+}
+
+function valueMask(sosImg) {
+  var zero  = sosImg.select(['NDVI_EOS', 'EVI_EOS']).eq(0)
+                    .reduce(ee.Reducer.max());
+  var minus = sosImg.select(['NDVI_EOS', 'EVI_EOS']).eq(-999)
+                    .reduce(ee.Reducer.max());
+  return zero.or(minus).not().selfMask();
+}
+
+// fetch newest LC image ≤ SOS year   (2000 uses 2001 LC)
+function fetchLc(year) {
+  var endYear = (year < 2001) ? 2001 : year;      // ensures start ≤ end
+  var col = ee.ImageCollection('MODIS/061/MCD12Q1')
+               .filter(ee.Filter.calendarRange(2001, endYear, 'year'))
+               .sort('system:time_start', false); // newest first
+  return col.first();                             // null if none
+}
+
+// ───── preview layer ─────────────────────────────────────────
+(function () {
+  var yr  = inspectYear;
+  var sos = ee.Image('projects/horia-olariu/assets/Greening/EOS_' + yr + '_CONUS');
+  var lc  = fetchLc(yr);
+
+  if (lc) {
+    var mask   = lcMask(lc).and(valueMask(sos));
+    var pre    = sos.updateMask(mask);          // <-- NO reproject here
+
+    Map.centerObject(pre, 4);
+    Map.addLayer(
+      pre.select('NDVI_EOS'),
+      {min: 265, max: 365, palette: [
+        '006837','1a9850','66bd63','a6d96a','d9ef8b',
+        'ffffbf','fee08b','fdae61','f46d43','d73027','a50026'
+      ]},
+      'NDVI_EOS ' + yr + ' (masked preview)'
+    );
+  } else {
+    print('⚠️  No land‑cover image available for preview year', yr);
+  }
+})();
+
+
+// ───── export loop ───────────────────────────────────────────
+// Define your conus region once:
+var conus = ee.FeatureCollection(
+    'projects/horia-olariu/assets/Greening/CONUS_Union'
+  )
+  .filter(ee.Filter.eq('name','CONUS_outline'))
+  .geometry();
+
+for (var year = 2000; year <= 2024; year++) {
+  var sos = ee.Image('projects/horia-olariu/assets/Greening/EOS_' + year + '_CONUS');
+  var lc  = fetchLc(year);
+  if (!lc) {
+    print('⚠️  Skipping', year, '— no land‑cover image available.');
+    continue;
+  }
+
+  var clean = sos
+    .updateMask(lcMask(lc).and(valueMask(sos)));
+    // No .reproject() here—export will handle it
+
+  Export.image.toAsset({
+    image:       clean,
+    description: 'Export_EOS_' + year + '_masked',
+    assetId:     'projects/horia-olariu/assets/Greening/EOS_' +
+                 year + '_CONUS_masked',
+    region:      conus,            // <-- use a real, bounded geometry
+    crs:         outCrs,           // 'EPSG:4326'
+    scale:       500,      // 0.0045 (deg ≈ 500 m)
+    maxPixels:   1e13
+  });
+
+  print('Queued export for', year);
+}
+
+/*****************************************************************
+ *  ADDITION  ▸  POS-CLEAN & LENGTH (2000 – 2024)
+ *
+ *  Inputs  :  POS_<year>_CONUS   (4 bands per image)
+ *               NDVI_POSstart , NDVI_POSend ,
+ *               EVI_POSstart  , EVI_POSend
+ *
+ *  Masks   :  • Cropland / Urban / Mosaic / Barren  (LC 12,13,14,16)
+ *             • any pixel where any of the 4 bands == 0  or  –999
+ *
+ *  Adds    :  2 derived bands
+ *               NDVI_POSlen = NDVI_POSend – NDVI_POSstart + 1
+ *               EVI_POSlen  = EVI_POSend  – EVI_POSstart  + 1
+ *
+ *  Output  :  25 images   POS_<year>_CONUS_masked
+ *             (6 bands, EPSG:4326, 500 m)
+ *****************************************************************/
+
+// ── mask for the four POS bands (same logic as EOS valueMask) ──
+function posValueMask(posImg) {
+  // flag 0 or –999 for any of the 4 bands
+  var zero  = posImg.select([
+        'NDVI_POSstart','NDVI_POSend',
+        'EVI_POSstart' ,'EVI_POSend'])
+        .eq(0).reduce(ee.Reducer.max());
+  var minus = posImg.select([
+        'NDVI_POSstart','NDVI_POSend',
+        'EVI_POSstart' ,'EVI_POSend'])
+        .eq(-999).reduce(ee.Reducer.max());
+  return zero.or(minus).not().selfMask();
+}
+
+// ── export loop for POS rasters ───────────────────────────────
+for (var year = 2000; year <= 2024; year++) {
+
+  var pos = ee.Image('projects/horia-olariu/assets/Greening/POS_' +
+                     year + '_CONUS');
+  var lc  = fetchLc(year);                        // <- same helper as EOS
+  if (!lc) {
+    print('⚠️  Skipping', year, '— no land-cover image available.');
+    continue;
+  }
+
+  // combined clean mask
+  var cleanMask = lcMask(lc).and(posValueMask(pos));
+
+  // apply mask and add length bands
+  var masked = pos.updateMask(cleanMask);
+
+  var ndviLen = masked.select('NDVI_POSend')
+                      .subtract(masked.select('NDVI_POSstart'))
+                      .add(1)
+                      .int16()
+                      .rename('NDVI_POSlen');
+
+  var eviLen  = masked.select('EVI_POSend')
+                      .subtract(masked.select('EVI_POSstart'))
+                      .add(1)
+                      .int16()
+                      .rename('EVI_POSlen');
+
+  var outImg  = masked.addBands([ndviLen, eviLen]);
+
+  Export.image.toAsset({
+    image      : outImg,
+    description: 'Export_POS_' + year + '_masked',
+    assetId    : 'projects/horia-olariu/assets/Greening/POS_' +
+                 year + '_CONUS_masked',
+    region     : conus,      // same CONUS outline geometry
+    crs        : outCrs,     // 'EPSG:4326'
+    scale      : 500,
+    maxPixels  : 1e13
+  });
+
+  print('Queued POS export for', year);
+}

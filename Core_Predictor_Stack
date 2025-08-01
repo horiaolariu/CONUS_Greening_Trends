@@ -1,0 +1,161 @@
+/***********************************************************************
+ *   UNIFIED EXPORTER  (clips to CONUS_Union geometry)
+ *   Grid / CRS = exact 500 m grid of Phenology_2000_CONUS  (EPSG:4326)
+ **********************************************************************/
+
+/* ─── Toggle sections ──────────────────────────────────────────────── */
+var EXPORT_STATIC = true;    // elev / slope / aspect / gwDepth
+var EXPORT_CORE   = true;    // prcp, tmax, tmin, VPD, snow
+var EXPORT_LSF    = true;    // LST-Day / LST-Night / LAI / FPAR
+
+/* ─── Paths / grid / geometry ─────────────────────────────────────── */
+var FOLDER  = 'projects/horia-olariu/assets/Greening/';
+var REF_IMG = 'projects/horia-olariu/assets/Greening/Phenology_2000_CONUS';
+var CONUS   = ee.FeatureCollection('projects/horia-olariu/assets/Greening/CONUS_Union')
+                 .geometry();                       // ← clip geometry
+
+var ref        = ee.Image(REF_IMG);
+var grid       = ref.projection();                  // exact 500 m transform
+var yrs        = ee.List.sequence(2000, 2024);
+
+/* ─── Helper wrappers ─────────────────────────────────────────────── */
+function toGrid(i){ return i.reproject(grid).toFloat(); }
+function blank(name){ return ee.Image.constant(0)
+                         .rename(name)
+                         .updateMask(ee.Image.constant(0))
+                         .reproject(grid); }
+var SEAS = [
+  {n:'Winter',s:[-1,12,1],e:[0,2,28]},
+  {n:'Spring',s:[ 0, 3,1],e:[0,5,31]},
+  {n:'Summer',s:[ 0, 6,1],e:[0,8,31]},
+  {n:'Fall',  s:[ 0, 9,1],e:[0,11,30]}
+];
+function rel(y,t){ return ee.Date.fromYMD(y+t[0],t[1],t[2]); }
+function esat(t){ return ee.Image.constant(0.6108)
+                    .multiply(t.multiply(17.27).divide(t.add(237.3)).exp()); }
+function ann(ic,b,red,y){
+  var col=ic.filterDate(y+'-01-01',(y+1)+'-01-01').select(b);
+  return (col.size().gt(0)? col.reduce(red): blank(b+'_'+y))
+           .rename(b+'_'+y); }
+function seas(ic,b,red,y){
+  return ee.Image(SEAS.map(function(s){
+    if (y===2000&&s.n==='Winter') return blank(b+'_'+s.n+'_'+y);
+    var col=ic.filterDate(rel(y,s.s),rel(y,s.e).advance(1,'day')).select(b);
+    return (col.size().gt(0)? col.reduce(red): blank(b+'_'+s.n+'_'+y))
+             .rename(b+'_'+s.n+'_'+y);
+  }));
+}
+
+/* ─── STATIC predictors (elev / slope / aspect / gwDepth) ─────────── */
+var elev = toGrid(
+  ee.Image('NASA/NASADEM_HGT/001').select('elevation')
+    .reduceResolution({reducer:ee.Reducer.mean(),maxPixels:1024})
+    .reproject(grid).rename('elev'));
+var slope  = ee.Terrain.slope(elev).rename('slope');
+var aspect = ee.Terrain.aspect(elev).rename('aspect');
+var gw     = toGrid(
+  ee.ImageCollection('projects/sat-io/open-datasets/GLOBGM/TRANSIENT/WTD')
+    .filterDate('2000-01-01','2016-01-01')
+    .mean().rename('gwDepth'));
+
+/* ─── EXPORT section 1: staticPredictors_500m ─────────────────────── */
+if (EXPORT_STATIC){
+  Export.image.toAsset({
+    image : ee.Image([elev,slope,aspect,gw]).clip(CONUS),
+    description: 'export_staticPredictors',
+    assetId: FOLDER + 'staticPredictors_500m',
+    region: CONUS,
+    scale : 500,
+    crs   : 'EPSG:4326',
+    maxPixels: 1e13
+  });
+}
+
+/* ─── Collections for dynamic blocks (loaded if needed) ───────────── */
+var daymet, snowIC, mod11, mcd15;
+if (EXPORT_CORE || EXPORT_LSF){
+  daymet = ee.ImageCollection('NASA/ORNL/DAYMET_V4').map(toGrid);
+  snowIC = ee.ImageCollection('MODIS/061/MOD10A2')
+              .select('Eight_Day_Snow_Cover')
+              .map(function(i){ return toGrid(i.updateMask(i.neq(200))); });
+}
+if (EXPORT_LSF){
+  mod11 = ee.ImageCollection('MODIS/061/MOD11A2')
+            .map(function(i){ return toGrid(i.multiply(0.02).subtract(273.15)); });
+  mcd15 = ee.ImageCollection('MODIS/061/MCD15A3H')
+            .map(function(i){
+              var ok=i.select('FparLai_QC').bitwiseAnd(3).eq(0);
+              return toGrid(i.updateMask(ok).multiply(0.01));
+            });
+}
+
+/* ─── EXPORT section 2: corePredictor_<year> ──────────────────────── */
+if (EXPORT_CORE){
+  yrs.evaluate(function(list){
+    list.forEach(function(y){
+      y=parseInt(y,10);
+
+      var Pann = ann(daymet,'prcp',ee.Reducer.sum(),  y);
+      var Txann= ann(daymet,'tmax',ee.Reducer.mean(), y);
+      var Tnann= ann(daymet,'tmin',ee.Reducer.mean(), y);
+      var Vann = esat(Txann).subtract(esat(Tnann)).rename('vpd_'+y);
+
+      var Pseas = seas(daymet,'prcp',ee.Reducer.sum(),  y);
+      var Txseas= seas(daymet,'tmax',ee.Reducer.mean(), y);
+      var Tnseas= seas(daymet,'tmin',ee.Reducer.mean(), y);
+      var Vseas = ee.Image(SEAS.map(function(s){
+         var tx=Txseas.select('tmax_'+s.n+'_'+y);
+         var tn=Tnseas.select('tmin_'+s.n+'_'+y);
+         return esat(tx).subtract(esat(tn))
+                  .rename('vpd_'+s.n+'_'+y);
+      }));
+
+      var snow = snowIC.filterDate(y+'-01-01',(y+1)+'-01-01')
+                       .map(function(i){return i.gt(0);}).sum()
+                       .rename('snowDays_'+y).reproject(grid);
+
+      Export.image.toAsset({
+        image : ee.Image([Pann,Txann,Tnann,Vann,snow,
+                          Pseas,Txseas,Tnseas,Vseas]).clip(CONUS),
+        description: 'corePredictor_'+y,
+        assetId: FOLDER + 'corePredictor_' + y,
+        region: CONUS,
+        scale : 500,
+        crs   : 'EPSG:4326',
+        maxPixels: 1e13
+      });
+    });
+  });
+}
+
+/* ─── EXPORT section 3: lstLaiFpar_<year> ─────────────────────────── */
+if (EXPORT_LSF){
+  yrs.evaluate(function(list){
+    list.forEach(function(y){
+      y=parseInt(y,10);
+
+      function A(ic,b,r){ return ann(ic,b,r,y); }
+      function S(ic,b,r){ return seas(ic,b,r,y); }
+
+      var d   = {ann:A(mod11,'LST_Day_1km',  ee.Reducer.mean()),
+                 seas:S(mod11,'LST_Day_1km', ee.Reducer.mean())};
+      var n   = {ann:A(mod11,'LST_Night_1km',ee.Reducer.mean()),
+                 seas:S(mod11,'LST_Night_1km',ee.Reducer.mean())};
+      var lai = {ann:A(mcd15,'Lai', ee.Reducer.mean()),
+                 seas:S(mcd15,'Lai', ee.Reducer.mean())};
+      var fp  = {ann:A(mcd15,'Fpar',ee.Reducer.mean()),
+                 seas:S(mcd15,'Fpar',ee.Reducer.mean())};
+
+      Export.image.toAsset({
+        image : ee.Image([d.ann,n.ann,lai.ann,fp.ann,
+                          d.seas,n.seas,lai.seas,fp.seas]).clip(CONUS),
+        description: 'lstLaiFpar_'+y,
+        assetId: FOLDER + 'lstLaiFpar_' + y,
+        region: CONUS,
+        scale : 500,
+        crs   : 'EPSG:4326',
+        maxPixels: 1e13
+      });
+    });
+  });
+}

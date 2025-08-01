@@ -1,0 +1,135 @@
+/***************************************************************
+ *  ROBUST THEIL–SEN SLOPES   – 10-band stack  (CONUS, 2000-2024)
+ ***************************************************************/
+
+/*** ── USER SETTINGS ───────────────────────────────────────── */
+var TARGET_BANDS = [
+  'NDVI_EOS','EVI_EOS',
+  'NDVI_POSstart','NDVI_POSend','EVI_POSstart','EVI_POSend',
+  'NDVI_POSlen','EVI_POSlen',
+  'NDVI_SOS','EVI_SOS'
+];
+var FIRST_YEAR = 2000;
+var LAST_YEAR  = 2024;
+var MIN_OBS    = 20;      // min # valid years
+var P_THRESH   = 0.05;    // Kendall-tau two-tailed p
+var FILL_VALUE = null;    // set to –9999 if rasters use a fill value
+
+/*  AOI: precise CONUS outline  */
+var AOI = ee.FeatureCollection(
+            'projects/horia-olariu/assets/Greening/CONUS_Union')
+          .filter(ee.Filter.eq('name', 'CONUS_outline'))
+          .geometry();
+/***************************************************************/
+
+
+/****************************************************************
+ *  A.  LAND-COVER QC   (MODIS MCD12Q1 LC_Type5, 2001 ↔ 2023)
+ ****************************************************************/
+var lc = ee.ImageCollection('MODIS/061/MCD12Q1').select('LC_Type5');
+var lc2001 = lc.filterDate('2001-01-01', '2002-01-01').first();
+var lc2023 = lc.filterDate('2023-01-01', '2024-01-01').first();
+
+// forest subclasses (1–4) → code 100
+function recode(img) {
+  var forest = img.eq(1).or(img.eq(2)).or(img.eq(3)).or(img.eq(4));
+  return img.where(forest, 100);
+}
+var lcStart = recode(lc2001);
+var lcEnd   = recode(lc2023);
+
+// 1 = pixels whose class is unchanged 2001-2023
+var lcStableMask = lcStart.eq(lcEnd).clip(AOI);
+
+
+/****************************************************************
+ *  B.  FUNCTION  –  robust slope for one phenology band
+ ****************************************************************/
+function robustSlopeBand(bandName) {
+
+  // ---- Build ImageCollection (client-side loop for constant IDs) ----
+  var list = [];
+  for (var y = FIRST_YEAR; y <= LAST_YEAR; y++) {
+    var id = 'projects/horia-olariu/assets/Greening/Phenology_' +
+             y + '_CONUS';                 // plain JS string
+    var img = ee.Image(id).select(bandName);
+
+    if (FILL_VALUE !== null)
+      img = img.updateMask(img.neq(FILL_VALUE));
+
+    img = img.updateMask(lcStableMask)
+             .addBands(ee.Image.constant(y).rename('year').toInt())
+             .set('system:time_start', ee.Date.fromYMD(y,1,1).millis());
+
+    list.push(img);
+  }
+  var coll = ee.ImageCollection(list);
+
+  // ---- Theil-Sen slope ---------------------------------------------
+  var slope = coll.select(['year', bandName])
+                  .reduce(ee.Reducer.sensSlope())
+                  .select('slope');           // generic name → rename later
+
+  // ---- Kendall τ  &  p-value ---------------------------------------
+  var tau = coll.select(['year', bandName])
+                .reduce(ee.Reducer.kendallsCorrelation())
+                .select(0);                   // first band = τ
+
+  var n = coll.select(bandName).reduce(ee.Reducer.count());
+
+  var z = tau.multiply(
+            n.multiply(n.subtract(1)).multiply(9)
+             .divide(n.multiply(2).add(5).multiply(2))
+             .sqrt());
+
+  var p = z.abs()
+           .multiply(-1/Math.sqrt(2))
+           .erf()
+           .add(1)
+           .multiply(2);
+
+  // keep robust pixels
+  var robust = slope.updateMask(n.gte(MIN_OBS).and(p.lte(P_THRESH)))
+                    .rename(bandName + '_slope');
+
+  return robust;
+}
+
+
+/****************************************************************
+ *  C.  STACK ALL 10 SLOPE BANDS  (clean names)
+ ****************************************************************/
+var slopeList  = TARGET_BANDS.map(robustSlopeBand);               // list
+
+var slopeNames = TARGET_BANDS.map(function(b){ return b + '_slope'; });
+
+var slopeStack = ee.Image.cat(slopeList)                          // concat
+                   .rename(slopeNames)                            // clean
+                   .clip(AOI);
+
+
+/****************************************************************
+ *  D.  QUICK LOOK  (optional)
+ ****************************************************************/
+Map.centerObject(AOI, 4);
+Map.addLayer(
+  slopeStack.select('NDVI_SOS_slope'),
+  {min:-2, max:2, palette:
+   ['#67001f','#b2182b','#d6604d','#f4a582','#f7f7f7',
+    '#92c5de','#4393c3','#2166ac','#053061']},
+  'EVI_SOS robust slope'
+);
+
+
+/****************************************************************
+ *  E.  EXPORT  (single 10-band raster)
+ ****************************************************************/
+Export.image.toAsset({
+  image:      slopeStack,
+  description:'SenSlope_10band_stableLC_robust',
+  assetId:    'projects/horia-olariu/assets/Greening/' +
+              'GreeningTrends',
+  region:     AOI,
+  scale:      500,
+  maxPixels:  1e13
+});

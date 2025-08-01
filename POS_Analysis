@@ -1,0 +1,158 @@
+/***************************************************************
+ * Peak-of-Season (POS)  —  CONUS outline   (MOD13A1, 500 m)
+ * Plateau = fitted VI ≥ 80 % of annual max • DOY 60 – 334
+ *
+ * Bands exported (4 total):
+ *   NDVI_POSstart , NDVI_POSend ,
+ *   EVI_POSstart  , EVI_POSend
+ *
+ * POSlen has been **removed**.
+ ***************************************************************/
+
+/* ── 0. SETTINGS ─────────────────────────────────────────── */
+var startYear  = 2000,
+    endYear    = 2024,
+    sampleYear = 2015,
+    scaleVI    = 0.0001;                 // MOD13A1 scale
+
+/* ── 1. AOI : CONUS outline ─────────────────────────────── */
+var conus = ee.FeatureCollection(
+               'projects/horia-olariu/assets/Greening/CONUS_Union')
+               .filter('name == "CONUS_outline"')
+               .geometry();
+Map.centerObject(conus, 4);
+
+/* ── 2. LOAD MODIS & QA mask ────────────────────────────── */
+var mod = ee.ImageCollection('MODIS/061/MOD13A1')
+  .filterBounds(conus)
+  .filterDate('2000-02-24', '2025-04-04')
+  .map(function(im){
+        var land = im.select('DetailedQA')
+                     .rightShift(11).bitwiseAnd(7).eq(1);
+        return im.updateMask(land);
+  });
+
+/* ── 3. scale NDVI/EVI + add DOY ────────────────────────── */
+function addVIs(im){
+  var doy = im.date().getRelative('day','year');
+  return im
+    .addBands(im.select('NDVI').multiply(scaleVI).rename('NDVI'), null, true)
+    .addBands(im.select('EVI' ).multiply(scaleVI).rename('EVI' ), null, true)
+    .addBands(ee.Image.constant(doy).int16().rename('doy'))
+    .set('doy', doy);
+}
+var viCol = mod.map(addVIs);
+
+/* ── 4. 3-day rolling-mean baseline (2000-24) ───────────── */
+var baseline = viCol.filter(ee.Filter.calendarRange(startYear,endYear,'year'));
+var doys     = baseline.aggregate_array('doy').distinct().sort();
+
+var rolling = ee.ImageCollection(
+  doys.map(function(d){
+      var win = baseline.filter(
+            ee.Filter.and(
+              ee.Filter.gte('doy', ee.Number(d).subtract(1)),
+              ee.Filter.lte('doy', ee.Number(d).add(1))));
+      return win.mean().set('doy', d);        // empty → fully masked
+  })
+).filter(ee.Filter.notNull(['doy']));
+
+var vegMask = rolling.mean().select('NDVI').gte(0.10);
+
+/* ── 5. polynomial-fit helpers ───────────────────────────── */
+var cN = ['c0','c1','c2','c3','c4','c5','c6'];
+
+function addPred(im){
+  var x = im.select('doy').toFloat();
+  return im.addBands(ee.Image.cat([
+     ee.Image.constant(1), x, x.pow(2), x.pow(3),
+     x.pow(4), x.pow(5), x.pow(6)
+  ]).rename(cN));
+}
+
+function coeffs(idx, yr){
+  var start = (yr===2000) ? '2000-02-24' : yr+'-01-01';
+  var col   = viCol.filterDate(start, yr+'-12-31')
+                   .filterBounds(conus)
+                   .map(addPred)
+                   .select(cN.concat([idx]))
+                   .map(function(im){ return im.updateMask(vegMask); });
+
+  var fit = col.reduce(ee.Reducer.linearRegression({numX:7,numY:1}))
+               .select('coefficients')
+               .arrayProject([0]).arrayFlatten([cN])
+               .rename(cN.map(function(c){return idx+'_'+c;}));
+
+  return fit.unmask(-999);                      // safe coeffs
+}
+
+function evalPoly(C,d,idx){
+  var x = ee.Image.constant(d);
+  var y = C.select(idx+'_c0');
+  for (var p=1; p<=6; p++)
+      y = y.add(C.select(idx+'_c'+p).multiply(x.pow(p)));
+  return y;
+}
+
+/* ── 6. POS start/end (no length) ────────────────────────── */
+function posStartEnd(idx, yr){
+  var C    = coeffs(idx, yr);
+  var days = ee.List.sequence(60, 334);
+
+  var series = days.map(function(d){
+        return evalPoly(C,d,idx).set('doy', d);
+  });
+  var thr = ee.ImageCollection(series).max().multiply(0.8);
+
+  var maskIC = ee.ImageCollection(series.map(function(im){
+        im = ee.Image(im);
+        return ee.Image.constant(im.get('doy')).int16()
+                 .updateMask(im.gte(thr));
+  }));
+
+  var start = maskIC.min().int16().where(maskIC.min().eq(0), -999)
+                .rename(idx+'_POSstart');
+  var end   = maskIC.max().int16().where(maskIC.max().eq(0), -999)
+                .rename(idx+'_POSend');
+  return ee.Image.cat([start, end]);
+}
+
+/* ── 7. EXPORT LOOP  (one task per year) ─────────────────── */
+var outRoot = 'projects/horia-olariu/assets/Greening/POS_';
+
+for (var yr = startYear; yr <= endYear; yr++) {
+
+  var posYear = ee.Image.cat([
+        posStartEnd('NDVI', yr),
+        posStartEnd('EVI' , yr)
+  ])
+  .clip(conus)
+  .reproject({crs:'EPSG:4326', scale:500})
+  .selfMask()
+  .unmask(-999)
+  .set('year', yr);
+
+  Export.image.toAsset({
+    image      : posYear,
+    description: 'POS_'+yr+'_CONUS',
+    assetId    : outRoot + yr + '_CONUS',
+    region     : conus,
+    scale      : 500,
+    crs        : 'EPSG:4326',
+    pyramidingPolicy: {'.default':'sample'},
+    maxPixels  : 1e13
+  });
+}
+
+/* ── 8. MAP PREVIEW ──────────────────────────────────────── */
+var preview = ee.Image.cat([
+      posStartEnd('NDVI', sampleYear),
+      posStartEnd('EVI' , sampleYear)
+]).clip(conus);
+
+Map.addLayer(preview.select('NDVI_POSstart'),
+  {min:60,max:300,palette:['purple','cyan','green','yellow','red']},
+  'NDVI POS start '+sampleYear);
+Map.addLayer(preview.select('NDVI_POSend'),
+  {min:60,max:334,palette:['green','yellow','red']},
+  'NDVI POS end '+sampleYear);

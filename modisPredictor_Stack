@@ -1,0 +1,108 @@
+/********************************************************************
+ *  LST  +  LAI / FPAR  predictor stacks  (int16, scaled)
+ *  Grid  : 500 m grid of Phenology_2000_CONUS  (EPSG:4326)
+ *  Clip  : CONUS_Union
+ *  Years : 2000 – 2024
+ ********************************************************************/
+
+/* ── 1. paths, grid, geometry ──────────────────────────────────── */
+var OUT   = 'projects/horia-olariu/assets/Greening/';
+var REF   = 'projects/horia-olariu/assets/Greening/Phenology_2000_CONUS';
+var CLIP  = 'projects/horia-olariu/assets/Greening/CONUS_Union';
+
+var GRID  = ee.Image(REF).projection();             // exact 500 m grid
+var CONUS = ee.FeatureCollection(CLIP).geometry();
+var YEARS = ee.List.sequence(2000, 2024);
+
+/* ── 2. scale factors & utilities ──────────────────────────────── */
+var SCALE = { LST:100, LAI:1000, FPAR:10000 };      // multipliers → int16
+
+function quant(img, s){ return img.multiply(s).round().int16(); }
+function blank(name){   return ee.Image.constant(0).int16()
+                           .rename(name).updateMask(ee.Image.constant(0))
+                           .reproject(GRID); }
+
+/* season windows */
+var SEAS=[{n:'Winter',s:[-1,12,1],e:[0,2,28]}, {n:'Spring',s:[0,3,1],e:[0,5,31]},
+          {n:'Summer',s:[0,6,1],e:[0,8,31]},  {n:'Fall',  s:[0,9,1],e:[0,11,30]}];
+function rel(y,t){ return ee.Date.fromYMD(y+t[0], t[1], t[2]); }
+
+/* annual & seasonal reducers (return int16 bands) */
+function annualQ(ic, band, y, s){
+  var col = ic.filterDate(y+'-01-01',(y+1)+'-01-01').select(band);
+  var img = ee.Algorithms.If(col.size().gt(0), quant(col.mean(),s),
+                             blank(band+'_'+y));
+  return ee.Image(img).rename(band+'_'+y);
+}
+function seasonalQ(ic, band, y, s){
+  return ee.Image(SEAS.map(function(win){
+    if (y===2000 && win.n==='Winter') return blank(band+'_'+win.n+'_'+y);
+    var col = ic.filterDate(rel(y,win.s), rel(y,win.e).advance(1,'day'))
+                .select(band);
+    var im  = ee.Algorithms.If(col.size().gt(0), quant(col.mean(),s),
+                               blank(band+'_'+win.n+'_'+y));
+    return ee.Image(im).rename(band+'_'+win.n+'_'+y);
+  }));
+}
+
+/* ── 3. MODIS collections snapped to grid (float) ───────────────── */
+// LST composites → °C
+var mod11 = ee.ImageCollection('MODIS/061/MOD11A2').map(function(img){
+  var lst = img.select(['LST_Day_1km','LST_Night_1km'])
+               .multiply(0.02).subtract(273.15);            // °C
+  return ee.Image(lst)
+           .reproject(GRID)                                 // first
+           .copyProperties(img, ['system:time_start']);     // then keep date
+});
+
+// LAI & FPAR composites (good QA only)
+var mcd15 = ee.ImageCollection('MODIS/061/MCD15A3H').map(function(img){
+  var ok   = img.select('FparLai_QC').bitwiseAnd(3).eq(0);  // bits0-1 == 00
+  var lai  = img.select('Lai' ).updateMask(ok).multiply(0.01).rename('Lai');
+  var fpar = img.select('Fpar').updateMask(ok).multiply(0.01).rename('Fpar');
+  return ee.Image([lai,fpar])
+           .reproject(GRID)
+           .copyProperties(img, ['system:time_start']);
+});
+
+/* ── 4. loop & export -------------------------------------------- */
+YEARS.evaluate(function(list){
+  list.forEach(function(yy){
+    var y = parseInt(yy,10);
+
+    function A(ic,b,s){ return annualQ (ic,b,y,s); }
+    function S(ic,b,s){ return seasonalQ(ic,b,y,s); }
+
+    /* LST Day / Night  */
+    var LSTd_ann  = A(mod11,'LST_Day_1km',  SCALE.LST);
+    var LSTd_seas = S(mod11,'LST_Day_1km',  SCALE.LST);
+    var LSTn_ann  = A(mod11,'LST_Night_1km',SCALE.LST);
+    var LSTn_seas = S(mod11,'LST_Night_1km',SCALE.LST);
+
+    /* LAI & FPAR */
+    var LAI_ann   = A(mcd15,'Lai',  SCALE.LAI);
+    var LAI_seas  = S(mcd15,'Lai',  SCALE.LAI);
+    var FPAR_ann  = A(mcd15,'Fpar', SCALE.FPAR);
+    var FPAR_seas = S(mcd15,'Fpar', SCALE.FPAR);
+
+    /* stack & export */
+    var stack = ee.Image([
+                  LSTd_ann,  LSTn_ann,  LAI_ann,  FPAR_ann,
+                  LSTd_seas, LSTn_seas, LAI_seas, FPAR_seas
+                ])
+                .clip(CONUS)
+                .set({ scale_LST  : 1.0 / SCALE.LST,
+                       scale_LAI  : 1.0 / SCALE.LAI,
+                       scale_FPAR : 1.0 / SCALE.FPAR });
+
+    Export.image.toAsset({
+      image      : stack,
+      description: 'lstLaiFpar_int16_' + y,
+      assetId    : OUT + 'lstLaiFpar_' + y,
+      region     : CONUS,
+      scale      : 500,
+      crs        : 'EPSG:4326',
+      maxPixels  : 1e13
+    });
+  });
+});
