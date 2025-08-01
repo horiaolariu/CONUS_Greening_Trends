@@ -1,0 +1,91 @@
+/***************************************************************
+ * STACK EOS + POS + SOS  (CONUS, 2000-2024, 500 m, EPSG:4326)
+ * ------------------------------------------------------------
+ * Inputs (already masked & re-sampled at 500 m):
+ *   • EOS_<year>_CONUS_masked   (2 bands)
+ *   • POS_<year>_CONUS_masked   (6 bands)
+ *   • SOS_<year>_CONUS_masked   (2 bands)
+ *
+ * Output per year  →  Greening/Phenology_<year>_CONUS   (10 bands)
+ *   NDVI_EOS , EVI_EOS ,
+ *   NDVI_POSstart , NDVI_POSend , EVI_POSstart , EVI_POSend ,
+ *   NDVI_POSlen   , EVI_POSlen ,
+ *   NDVI_SOS , EVI_SOS
+ *
+ * Band masks remain exactly as in the source rasters and all
+ * images are re-projected to the same 500 m EPSG:4326 grid to
+ * ensure pixel-perfect alignment.
+ ***************************************************************/
+
+/* -------- USER OPTIONS ------------------------------------*/
+var startYear   = 2000,
+    endYear     = 2024,
+    previewYear = 2015;
+
+var outCRS      = 'EPSG:4326';
+var outScaleDeg = 0.0045;    // ≈ 500 m
+
+/* -------- AOI  (CONUS outline) ----------------------------*/
+var conus = ee.FeatureCollection(
+               'projects/horia-olariu/assets/Greening/CONUS_Union')
+               .filter('name == "CONUS_outline"')
+               .geometry();
+Map.centerObject(conus, 4);
+
+/* -------- helper: align an image to reference projection --*/
+function align(img, refProj){
+  return img.reproject(refProj);   // same CRS, same 500 m grid
+}
+
+/* -------- YEAR LOOP  -------------------------------------*/
+var root = 'projects/horia-olariu/assets/Greening/';
+
+for (var yr = startYear; yr <= endYear; yr++) {
+
+  /* load the three masked rasters */
+  var eos = ee.Image(root + 'EOS_' + yr + '_CONUS_masked');
+  var pos = ee.Image(root + 'POS_' + yr + '_CONUS_masked');
+  var sos = ee.Image(root + 'SOS_' + yr + '_CONUS_masked');
+
+  /* use EOS projection as reference for perfect alignment */
+  var refProj = eos.projection();
+
+  pos = align(pos, refProj);
+  sos = align(sos, refProj);
+
+  /* stack all 10 bands */
+  var stack = eos.addBands(pos).addBands(sos)
+                 .clip(conus)
+                 .set('year', yr);
+
+  /* preview one year on the map */
+  if (yr === previewYear){
+    Map.addLayer(stack.select('NDVI_POSstart'),
+      {min:60, max:300,
+       palette:['purple','cyan','green','yellow','red']},
+      'NDVI POS start '+yr);
+    Map.addLayer(stack.select('NDVI_EOS'),
+      {min:265, max:365,
+       palette:['006837','1a9850','66bd63','a6d96a','d9ef8b',
+                'ffffbf','fee08b','fdae61','f46d43','d73027','a50026']},
+      'NDVI EOS '+yr);
+    Map.addLayer(stack.select('NDVI_SOS'),
+      {min:  0, max:273,
+       palette:['purple','cyan','green','yellow','red']},
+      'NDVI SOS '+yr);
+  }
+
+  /* export combined raster */
+  Export.image.toAsset({
+    image      : stack,
+    description: 'Phenology_'+yr+'_CONUS',
+    assetId    : root + 'Phenology_' + yr + '_CONUS',
+    region     : conus,
+    crs        : outCRS,
+    scale      : 500,
+    pyramidingPolicy: {'.default':'sample'},
+    maxPixels  : 1e13
+  });
+
+  print('Queued export for', yr);
+}
